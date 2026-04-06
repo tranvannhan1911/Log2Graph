@@ -8,7 +8,7 @@ and convert them into TUDataset format (but with directed version)
 
 """
 # the absolute path of the Logs2Graph project
-root_path = r'/home/SteveJobs/Logs2Graph'
+root_path = r'/Users/tranvannhan1911/Documents/Masters/Lab/Logs2Graph'
 
 # =============================================================================
 # PreStep 1: Load parsered dataset BGL

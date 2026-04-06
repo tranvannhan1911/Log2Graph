@@ -5,7 +5,7 @@ df['GroupId'] = df['ParameterList'].str.extract('(blk\_[-]?\d+)', expand=False)
 
 """
 # the absolute path of the Logs2Graph project
-root_path = r'/home/SteveJobs/Logs2Graph'
+root_path = r'/Users/tranvannhan1911/Documents/Masters/Lab/Logs2Graph'
 
 import warnings
 warnings.filterwarnings("ignore")
