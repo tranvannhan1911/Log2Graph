@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.io import read_txt_array
-from torch_geometric.utils import coalesce, remove_self_loops
+from torch_geometric.utils import coalesce, remove_self_loops, negative_sampling
 
 
 ##define a function to read file
@@ -528,6 +528,236 @@ class MeanTrainer:
 
             return ap, roc_auc, dists, labels
 
+# =============================================================================
+# VGAETrainer
+# =============================================================================
+
+import torch.nn.functional as F
+
+from torch_geometric.utils import negative_sampling
+
+def build_fixed_negative_edges(loader, device):
+    """
+    Generate fixed negative edges for each batch in loader.
+    Return list of neg_edge_index tương ứng từng batch.
+    """
+    neg_edges_all = []
+
+    for batch in loader:
+        batch = batch.to(device)
+        edge_index = batch.edge_index
+
+        neg_edge_index_list = []
+
+        for g in range(batch.num_graphs):
+            node_mask = (batch.batch == g).nonzero(as_tuple=False).view(-1)
+            if node_mask.numel() < 2:
+                continue
+
+            mask_src = (edge_index[0] >= node_mask[0]) & (edge_index[0] <= node_mask[-1])
+            mask_dst = (edge_index[1] >= node_mask[0]) & (edge_index[1] <= node_mask[-1])
+            mask_both = mask_src & mask_dst
+            pos_idx = mask_both.nonzero(as_tuple=False).view(-1)
+
+            if pos_idx.numel() == 0:
+                continue
+
+            n_nodes = node_mask.numel()
+            local_pos = edge_index[:, pos_idx] - node_mask[0]
+
+            neg_local = negative_sampling(
+                edge_index=local_pos,
+                num_nodes=n_nodes,
+                num_neg_samples=pos_idx.numel()
+            )
+
+            neg_global = neg_local.clone()
+            neg_global[0] = node_mask[neg_global[0]]
+            neg_global[1] = node_mask[neg_global[1]]
+
+            neg_edge_index_list.append(neg_global)
+
+        if len(neg_edge_index_list) > 0:
+            neg_edge_index = torch.cat(neg_edge_index_list, dim=1)
+        else:
+            neg_edge_index = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+
+        neg_edges_all.append(neg_edge_index.cpu())  # lưu CPU để reuse
+
+    return neg_edges_all
+
+class VGAETrainer:
+    """Trainer for Variational Graph AutoEncoder (VGAE).
+
+    Train uses edge reconstruction (BCE on pos/neg edges) + KL divergence.
+    Test computes per-graph reconstruction score (mean edge loss) and returns
+    AP/ROC in the same format as `MeanTrainer.test` for compatibility.
+    """
+    def __init__(self, encoder, decoder, optimizer, device=torch.device("cpu"), kl_weight=1e-3):
+        self.device = device
+        self.encoder = encoder
+        self.decoder = decoder
+        self.optimizer = optimizer
+        self.kl_weight = kl_weight
+        self.test_neg_edges = None  # Cache fixed negative edges for testing
+
+    def _reparam(self, mu, logvar):
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def set_test_negatives(self, neg_edges_list):
+        self.test_neg_edges = neg_edges_list
+
+    def train(self, train_loader):
+        self.encoder.train()
+        self.decoder.train()
+
+        total_loss = 0.0
+        iters = 0
+
+        for batch in train_loader:
+            batch = batch.to(self.device)
+            x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
+
+            mu, logvar = self.encoder(x, edge_index, edge_attr)
+            z = self._reparam(mu, logvar)
+
+            # positive edges
+            pos_edge_index = edge_index
+            pos_logits = self.decoder(z, pos_edge_index, edge_attr)
+
+            # negative sampling per graph
+            neg_edge_index_list = []
+            neg_edge_attr_list = []
+            for g in range(batch.num_graphs):
+                node_mask = (batch.batch == g).nonzero(as_tuple=False).view(-1)
+                if node_mask.numel() < 2:
+                    continue
+                mask_src = (edge_index[0] >= node_mask[0]) & (edge_index[0] <= node_mask[-1])
+                mask_dst = (edge_index[1] >= node_mask[0]) & (edge_index[1] <= node_mask[-1])
+                mask_both = mask_src & mask_dst
+                pos_idx = mask_both.nonzero(as_tuple=False).view(-1)
+                num_pos = pos_idx.size(0) if pos_idx is not None else 0
+                if num_pos == 0:
+                    continue
+                n_nodes = node_mask.numel()
+                local_pos = edge_index[:, pos_idx] - node_mask[0]
+                neg_local = negative_sampling(edge_index=local_pos, num_nodes=n_nodes, num_neg_samples=pos_idx.numel())
+                neg_global = neg_local.clone()
+                neg_global[0] = node_mask[neg_global[0]]
+                neg_global[1] = node_mask[neg_global[1]]
+                neg_edge_index_list.append(neg_global)
+                if edge_attr is not None:
+                    neg_edge_attr_list.append(torch.zeros((neg_global.size(1), edge_attr.size(1)), device=edge_attr.device))
+
+            if len(neg_edge_index_list) > 0:
+                neg_edge_index = torch.cat(neg_edge_index_list, dim=1)
+                neg_edge_attr = torch.cat(neg_edge_attr_list, dim=0) if len(neg_edge_attr_list) > 0 else None
+            else:
+                neg_edge_index = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+                neg_edge_attr = torch.empty((0, edge_attr.size(1) if edge_attr is not None else 0), device=edge_attr.device)
+
+            neg_logits = self.decoder(z, neg_edge_index, neg_edge_attr)
+
+            pos_labels = torch.ones_like(pos_logits)
+            neg_labels = torch.zeros_like(neg_logits)
+
+            logits = torch.cat([pos_logits, neg_logits], dim=0)
+            labels = torch.cat([pos_labels, neg_labels], dim=0).to(logits.device)
+
+            recon_loss = F.binary_cross_entropy_with_logits(logits, labels)
+            kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            loss = recon_loss + self.kl_weight * kld
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            iters += 1
+
+        return total_loss / max(1, iters)
+
+    def test(self, test_loader):
+        self.encoder.eval()
+        self.decoder.eval()
+
+        scores_all = []
+        labels_list = []
+
+        assert self.test_neg_edges is not None, "Call set_test_negatives() before test"
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_loader):
+                batch = batch.to(self.device)
+                x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
+
+                mu, logvar = self.encoder(x, edge_index, edge_attr)
+                z = mu
+
+                pos_edge_index = edge_index
+                pos_logits = self.decoder(z, pos_edge_index, edge_attr)
+
+                # 🔥 dùng fixed negatives
+                neg_edge_index = self.test_neg_edges[batch_idx].to(self.device)
+
+                if edge_attr is not None:
+                    neg_edge_attr = torch.zeros(
+                        (neg_edge_index.size(1), edge_attr.size(1)),
+                        device=edge_attr.device
+                    )
+                else:
+                    neg_edge_attr = None
+
+                neg_logits = self.decoder(z, neg_edge_index, neg_edge_attr)
+
+                pos_loss = F.binary_cross_entropy_with_logits(
+                    pos_logits, torch.ones_like(pos_logits), reduction='none'
+                )
+                neg_loss = F.binary_cross_entropy_with_logits(
+                    neg_logits, torch.zeros_like(neg_logits), reduction='none'
+                )
+
+                # mapping edges → graph
+                if pos_edge_index.numel() > 0:
+                    pos_graph = batch.batch[pos_edge_index[0]]
+                else:
+                    pos_graph = torch.tensor([], dtype=torch.long, device=self.device)
+
+                if neg_edge_index.numel() > 0:
+                    neg_graph = batch.batch[neg_edge_index[0]]
+                else:
+                    neg_graph = torch.tensor([], dtype=torch.long, device=self.device)
+
+                all_losses = torch.cat([pos_loss, neg_loss], dim=0)
+                all_graph = torch.cat([pos_graph, neg_graph], dim=0)
+
+                for g in range(batch.num_graphs):
+                    mask = (all_graph == g)
+                    if mask.sum() == 0:
+                        scores_all.append(0.0)
+                    else:
+                        # scores_all.append(all_losses[mask].mean().item())
+                        scores_all.append(all_losses[mask].mean())
+
+                labels_list.append(batch.y.cpu())
+
+        labels = torch.cat(labels_list).cpu()
+        scores = torch.tensor(scores_all)
+
+        try:
+            ap = average_precision_score(labels.numpy(), scores.numpy())
+        except Exception:
+            ap = -1
+
+        try:
+            roc = roc_auc_score(labels.numpy(), scores.numpy())
+        except Exception:
+            roc = -1
+
+        return ap, roc, scores, labels
+
 
 # =============================================================================
 # Step 4: Define three GNN models
@@ -537,7 +767,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BatchNorm1d
 from torch.nn import Sequential, Linear, ReLU
-from torch_geometric.nn import GINConv, global_mean_pool
+from torch_geometric.nn import GINConv, global_mean_pool, GATConv
 
 
 
@@ -597,19 +827,20 @@ class DiGCN(nn.Module):
     def __init__(self, nfeat, nhid, nlayer, dropout=0, bias=False, **kwargs):
         ##two layers
         super(DiGCN, self).__init__()
-        self.conv1 = DIGCNConv(nfeat, nhid)
-        self.conv2 = DIGCNConv(nhid, nhid)
+        self.conv1 = GATConv(nfeat, nhid, heads=1, dropout=dropout, bias=bias)
+        self.conv2 = GATConv(nhid, nhid, heads=1, dropout=dropout, bias=bias)
         
     def reset_parameters(self):
         self.conv1.reset_parameters()
         self.conv2.reset_parameters()
         
     def forward(self, data):
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        x, edge_index = data.x, data.edge_index
+        # Ignore edge_attr (PageRank), rely on self-attention edge coefficients
         
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
+        x = F.relu(self.conv1(x, edge_index))
         x = F.dropout(x, p=0.0, training=self.training)
-        x = self.conv2(x, edge_index, edge_attr)
+        x = self.conv2(x, edge_index)
 
         
         emb_list = []
@@ -618,6 +849,60 @@ class DiGCN(nn.Module):
             emb_list.append(emb)
     
         return emb_list        
+
+class BiDiGCN(nn.Module):
+    def __init__(self, nfeat, nhid, nlayer, dropout=0, bias=False, **kwargs):
+        super(BiDiGCN, self).__init__()
+        self.conv1_fwd = DIGCNConv(nfeat, nhid)
+        self.conv1_bwd = DIGCNConv(nfeat, nhid)
+        self.conv2_fwd = DIGCNConv(nhid, nhid)
+        self.conv2_bwd = DIGCNConv(nhid, nhid)
+        
+        # Proposal #2 & #3: Learnable gating and concatenation
+        self.alpha1 = nn.Parameter(torch.tensor(0.1))
+        self.alpha2 = nn.Parameter(torch.tensor(0.1))
+        self.lin1 = nn.Linear(nhid * 2, nhid)
+        self.lin2 = nn.Linear(nhid * 2, nhid)
+        
+    def reset_parameters(self):
+        self.conv1_fwd.reset_parameters()
+        self.conv1_bwd.reset_parameters()
+        self.conv2_fwd.reset_parameters()
+        self.conv2_bwd.reset_parameters()
+        self.lin1.reset_parameters()
+        self.lin2.reset_parameters()
+        
+    def forward(self, data):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        
+        # Reverse edges for backward flow
+        edge_index_bwd = torch.stack([edge_index[1], edge_index[0]], dim=0)
+        
+        # Unweighted backward edges (all 1s) to satisfy DIGCNConv's norm requirement
+        edge_attr_bwd = torch.ones_like(edge_attr)
+        
+        # Layer 1
+        x_fwd = F.relu(self.conv1_fwd(x, edge_index, edge_attr))
+        x_bwd = F.relu(self.conv1_bwd(x, edge_index_bwd, edge_attr_bwd)) # Proposal 1: unweighted backward edges
+        x_bwd_gated = self.alpha1 * x_bwd                           # Proposal 3: Learnable Gating
+        x = torch.cat([x_fwd, x_bwd_gated], dim=-1)                 # Proposal 2: Concatenation
+        x = self.lin1(x)
+        x = F.dropout(x, p=0.0, training=self.training)
+        
+        # Layer 2
+        x_fwd2 = self.conv2_fwd(x, edge_index, edge_attr)
+        x_bwd2 = self.conv2_bwd(x, edge_index_bwd, edge_attr_bwd)
+        x_bwd_gated2 = self.alpha2 * x_bwd2
+        x = torch.cat([x_fwd2, x_bwd_gated2], dim=-1)
+        x = self.lin2(x)
+
+        emb_list = []
+        for g in range(data.num_graphs):
+            emb = x[data.batch==g]
+            emb_list.append(emb)
+    
+        return emb_list
+
 
 ##### build  Inception Block for DiGCN model (Experiments show that InceptionBlock is not needed) 
 class InceptionBlock(nn.Module):

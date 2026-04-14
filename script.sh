@@ -7,7 +7,7 @@ mkdir -p "$LOG_DIR"
 
 # Danh sách các bộ dữ liệu cần chạy
 # DATASETS=("BGL" "Hadoop" "HDFS" "Spirit" "Thunderbird")
-DATASETS=("Hadoop" "Spirit" "Thunderbird")
+DATASETS=("BGL")
 
 echo "Starting job pipeline for all datasets..."
 
