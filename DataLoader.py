@@ -529,6 +529,109 @@ class MeanTrainer:
             return ap, roc_auc, dists, labels
 
 # =============================================================================
+# MultiCenterSVDDTrainer
+# =============================================================================
+
+from sklearn.cluster import KMeans
+
+class MultiCenterSVDDTrainer:
+    
+    def __init__(self, model, optimizer, num_centers=5, device=torch.device("cpu"), regularizer="variance"):
+        self.device = device
+        self.model = model
+        self.optimizer = optimizer
+        self.num_centers = num_centers
+        self.centers = None
+        self.regularizer = regularizer   
+    
+    def train(self, train_loader):
+        print("\n++++++++++++++++trainers.py++++++++++++++++")
+        print("----------train()----------")
+        self.model.train()
+        
+        if self.centers is None:
+            F_list = []
+
+        svdd_loss_accum = 0
+        total_iters = 0
+
+        for batch in train_loader:
+            print("\n++++++++++++++++trainers.py++++++++++++++++")
+            print("----------batch training start----------")
+            train_embeddings = self.model(batch)
+            print("----------batch training end----------")
+            
+            mean_train_embeddings = [torch.mean(emb, dim=0) for emb in train_embeddings]
+            F_train = torch.stack(mean_train_embeddings)
+                
+            if self.centers is None:
+                F_list.append(F_train)
+            else:
+                distances = torch.cdist(F_train, self.centers, p=2)**2
+                min_distances = torch.min(distances, dim=1).values
+                
+                svdd_loss = torch.mean(min_distances)
+                
+                self.optimizer.zero_grad()
+                svdd_loss.backward()    
+                self.optimizer.step()
+                
+                svdd_loss_accum += svdd_loss.detach().cpu().numpy()
+                total_iters += 1
+
+        if self.centers is None: 
+            full_F_list = torch.cat(F_list).detach().cpu().numpy()
+            num_samples = full_F_list.shape[0]
+            k_to_use = min(self.num_centers, num_samples)
+            
+            kmeans = KMeans(n_clusters=k_to_use, random_state=42, n_init=10)
+            kmeans.fit(full_F_list)
+            self.centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32).to(self.device)
+            average_svdd_loss = -1
+        else:
+            average_svdd_loss = svdd_loss_accum / max(total_iters, 1)
+
+        return average_svdd_loss
+
+
+    def test(self, test_loader):
+        print("\n++++++++++++++++trainers.py++++++++++++++++")
+        print("----------test()----------")
+        self.model.eval()
+        
+        with torch.no_grad():
+            dists_list = []
+            for batch in test_loader:
+                test_embeddings = self.model(batch)
+                mean_test_embeddings = [torch.mean(emb, dim=0) for emb in test_embeddings]
+                F_test = torch.stack(mean_test_embeddings)
+                
+                if self.centers is not None:
+                    distances = torch.cdist(F_test, self.centers, p=2)**2
+                    batch_dists = torch.min(distances, dim=1).values.cpu()
+                else:
+                    batch_dists = torch.zeros(F_test.size(0)).cpu()
+                    
+                dists_list.append(batch_dists)
+            
+            labels = torch.cat([batch.y for batch in test_loader])
+            dists = torch.cat(dists_list)
+
+            try:
+                ap = average_precision_score(y_true= labels, y_score= dists, average = None, pos_label= 1, sample_weight= None)
+            except Exception:
+                ap = -1
+            try:
+                roc_auc = roc_auc_score(y_true= labels, y_score= dists, average = None,
+                                        sample_weight= None, max_fpr = None, 
+                                        multi_class = 'raise', labels =None)
+            except Exception:
+                roc_auc = -1
+
+            return ap, roc_auc, dists, labels
+
+
+# =============================================================================
 # VGAETrainer
 # =============================================================================
 
@@ -767,7 +870,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BatchNorm1d
 from torch.nn import Sequential, Linear, ReLU
-from torch_geometric.nn import GINConv, global_mean_pool, GATConv
+from torch_geometric.nn import GINConv, global_mean_pool, GATConv, GlobalAttention
 
 
 
@@ -814,6 +917,52 @@ class GIN(nn.Module):
             emb_list.append(emb)
         #graph_embeds = torch.stack(graph_embeds)
 
+        return emb_list
+
+
+class AttentionGIN(nn.Module):
+    def __init__(self, nfeat, nhid, nlayer, dropout=0, act=ReLU(), bias=False, **kwargs):
+        super(AttentionGIN, self).__init__()
+        self.norm = BatchNorm1d
+        self.nlayer = nlayer
+        self.act = act
+        self.transform = Sequential(Linear(nfeat, nhid), self.norm(nhid))
+        
+        # Attention Pooling logic
+        self.attn = Sequential(Linear(nhid, nhid), self.act, Linear(nhid, 1))
+        self.pooling = GlobalAttention(self.attn)
+        self.dropout = nn.Dropout(dropout)
+
+        self.convs = nn.ModuleList()
+        self.nns = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        for i in range(nlayer):
+            self.nns.append(Sequential(Linear(nhid, nhid, bias=bias), 
+                                       act, Linear(nhid, nhid, bias=bias)))
+            self.convs.append(GINConv(self.nns[-1]))
+            self.bns.append(self.norm(nhid))
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        x = self.transform(x) 
+        
+        for i in range(self.nlayer):
+            x = self.dropout(x)
+            x = self.convs[i](x, edge_index)
+            x = self.act(x)
+            x = self.bns[i](x)
+
+        # Self-attention pooling over nodes in each graph
+        # Returns shape: (num_graphs, nhid)
+        g_emb = self.pooling(x, batch)
+
+        emb_list = []
+        for g in range(data.num_graphs):
+            # Wrap in shape (1, nhid) seamlessly for MeanTrainer
+            emb_list.append(g_emb[g].unsqueeze(0))
+            
         return emb_list
 
 
