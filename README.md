@@ -26,3 +26,18 @@ root_path = r'/Users/YourName/Desktop/Logs2Graph'
 
 ## References
 Our code is developed based on [GLAM](https://github.com/sawlani/GLAM) and [DiGCN](https://github.com/flyingtango/DiGCN).
+
+
+### VGAE
+Hadoop
+```bash
+source ./venv/bin/activate
+python main_model_VGAE.py --data hadoop --epochs 300 --batch 1024 --lr 0.01 --hidden_dim 128 --latent_dim 32 --device 0
+```
+
+BGL
+```bash
+source ./venv/bin/activate
+python main_model_VGAE.py --data BGL --epochs 100 --batch 512 --lr 0.01 --hidden_dim 300 --latent_dim 32 --device 0
+```
+

@@ -42,6 +42,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--save_output', action='store_true')
+    parser.add_argument('--stopearly', type=int, default=50)
     args = parser.parse_args()
 
     # 🔥 Tạo thư mục history
@@ -100,6 +101,9 @@ def main():
     trainer.set_test_negatives(test_neg_edges)
 
     epochinfo = []
+    
+    best_roc = -1
+    patience_cnt = 0
 
     for epoch in range(1, args.epochs + 1):
         print("\n+++++++++++++++++++VGAE++++++++++++++++++++++")
@@ -122,6 +126,15 @@ def main():
         TEMP.scores = scores
         TEMP.labels = labels
         epochinfo.append(TEMP)
+
+        if roc > best_roc:
+            best_roc = roc
+            patience_cnt = 0
+        else:
+            patience_cnt += 1
+            if args.stopearly > 0 and patience_cnt >= args.stopearly:
+                print(f"Early stopping at epoch {epoch} (patience={args.stopearly})")
+                break
 
 
     # best epoch
