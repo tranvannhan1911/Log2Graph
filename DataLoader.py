@@ -689,6 +689,137 @@ def build_fixed_negative_edges(loader, device):
 
     return neg_edges_all
 
+# =============================================================================
+# ContrastiveTrainer
+# =============================================================================
+
+from sklearn.ensemble import IsolationForest
+import numpy as np
+
+class ContrastiveTrainer:
+    def __init__(self, model, optimizer, temperature=0.1, device=torch.device("cpu"), regularizer="variance"):
+        self.device = device
+        self.model = model
+        self.optimizer = optimizer
+        self.temperature = temperature
+        self.detector = IsolationForest(n_estimators=100, random_state=42)
+        
+        import torch.nn as nn
+        self.projection_head = nn.Sequential(
+            nn.LazyLinear(256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        ).to(device)
+        self.proj_optimizer = torch.optim.Adam(self.projection_head.parameters(), lr=0.001)
+        
+    def augment(self, data):
+        aug_data = data.clone()
+        from torch_geometric.utils import dropout_adj
+        edge_index, _ = dropout_adj(aug_data.edge_index, p=0.1, force_undirected=True)
+        aug_data.edge_index = edge_index
+        
+        mask = torch.empty((aug_data.x.size(0), 1), dtype=torch.float32).uniform_(0, 1) > 0.1
+        aug_data.x = aug_data.x * mask.to(aug_data.x.device)
+        return aug_data
+
+    def nt_xent_loss(self, z1, z2):
+        import torch.nn.functional as F
+        batch_size = z1.size(0)
+        z = torch.cat([z1, z2], dim=0) 
+        z = F.normalize(z, p=2, dim=1)
+        sim = torch.mm(z, z.t()) / self.temperature
+        sim.fill_diagonal_(-1e9)
+        labels = torch.cat([torch.arange(batch_size, 2*batch_size), torch.arange(batch_size)]).to(self.device)
+        return F.cross_entropy(sim, labels)
+
+    def train(self, train_loader):
+        print("\n++++++++++++++++trainers.py++++++++++++++++")
+        print("----------train()----------")
+        self.model.train()
+        
+        total_loss = 0
+        total_iters = 0
+
+        for batch in train_loader:
+            print("\n++++++++++++++++trainers.py++++++++++++++++")
+            print("----------batch training start----------")
+            
+            batch1 = self.augment(batch).to(self.device)
+            batch2 = self.augment(batch).to(self.device)
+            
+            emb1 = self.model(batch1)
+            emb2 = self.model(batch2)
+            
+            z1 = torch.stack([torch.mean(e, dim=0) for e in emb1])
+            z2 = torch.stack([torch.mean(e, dim=0) for e in emb2])
+            
+            p1 = self.projection_head(z1)
+            p2 = self.projection_head(z2)
+            
+            loss = self.nt_xent_loss(p1, p2)
+            
+            self.optimizer.zero_grad()
+            self.proj_optimizer.zero_grad()
+            loss.backward()    
+            self.optimizer.step()
+            self.proj_optimizer.step()
+            
+            total_loss += loss.item()
+            total_iters += 1
+            print("----------batch training end----------")
+
+        self.model.eval()
+        train_embs = []
+        with torch.no_grad():
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                emb = self.model(batch)
+                z = torch.stack([torch.mean(e, dim=0) for e in emb])
+                train_embs.append(z.cpu().numpy())
+                
+        X_train = np.concatenate(train_embs, axis=0)
+        self.detector.fit(X_train)
+
+        return total_loss / max(total_iters, 1)
+
+    def test(self, test_loader):
+        print("\n++++++++++++++++trainers.py++++++++++++++++")
+        print("----------test()----------")
+        self.model.eval()
+        
+        dists_list = []
+        labels_list = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(self.device)
+                test_embeddings = self.model(batch)
+                mean_test_embeddings = [torch.mean(emb, dim=0) for emb in test_embeddings]
+                F_test = torch.stack(mean_test_embeddings).cpu().numpy()
+                
+                scores = -self.detector.decision_function(F_test)
+                
+                dists_list.append(torch.tensor(scores))
+                labels_list.append(batch.y.cpu())
+            
+            labels = torch.cat(labels_list)
+            dists = torch.cat(dists_list)
+
+            from sklearn.metrics import average_precision_score, roc_auc_score
+            try:
+                ap = average_precision_score(y_true= labels, y_score= dists, average = None, pos_label= 1, sample_weight= None)
+            except Exception:
+                ap = -1
+            try:
+                roc_auc = roc_auc_score(y_true= labels, y_score= dists, average = None,
+                                        sample_weight= None, max_fpr = None, 
+                                        multi_class = 'raise', labels =None)
+            except Exception:
+                roc_auc = -1
+
+            return ap, roc_auc, dists, labels
+
+
 class VGAETrainer:
     """Trainer for Variational Graph AutoEncoder (VGAE).
 
@@ -724,6 +855,7 @@ class VGAETrainer:
             x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
 
             mu, logvar = self.encoder(x, edge_index, edge_attr)
+            logvar = torch.clamp(logvar, max=10) # Prevent exp() overflow
             z = self._reparam(mu, logvar)
 
             # positive edges
@@ -775,6 +907,7 @@ class VGAETrainer:
 
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), max_norm=2.0)
             self.optimizer.step()
 
             total_loss += loss.item()
@@ -923,14 +1056,15 @@ class GIN(nn.Module):
 class AttentionGIN(nn.Module):
     def __init__(self, nfeat, nhid, nlayer, dropout=0, act=ReLU(), bias=False, **kwargs):
         super(AttentionGIN, self).__init__()
+        from torch_geometric.nn import Set2Set
         self.norm = BatchNorm1d
         self.nlayer = nlayer
         self.act = act
         self.transform = Sequential(Linear(nfeat, nhid), self.norm(nhid))
         
-        # Attention Pooling logic
-        self.attn = Sequential(Linear(nhid, nhid), self.act, Linear(nhid, 1))
-        self.pooling = GlobalAttention(self.attn)
+        # Set2Set Pooling logic with Jumping Knowledge
+        # We concatenate layers from 0 to nlayer, so dimension is nhid * (nlayer + 1)
+        self.pooling = Set2Set(nhid * (nlayer + 1), processing_steps=3)
         self.dropout = nn.Dropout(dropout)
 
         self.convs = nn.ModuleList()
@@ -947,20 +1081,25 @@ class AttentionGIN(nn.Module):
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
         x = self.transform(x) 
+        xs = [x]
         
         for i in range(self.nlayer):
             x = self.dropout(x)
             x = self.convs[i](x, edge_index)
             x = self.act(x)
             x = self.bns[i](x)
+            xs.append(x)
 
-        # Self-attention pooling over nodes in each graph
-        # Returns shape: (num_graphs, nhid)
-        g_emb = self.pooling(x, batch)
+        # Jumping Knowledge: concatenate all layers including initial transform
+        x_jk = torch.cat(xs, dim=-1)
+
+        # Set2Set pooling over nodes in each graph
+        # Returns shape: (num_graphs, 2 * nhid * (nlayer+1))
+        g_emb = self.pooling(x_jk, batch)
 
         emb_list = []
         for g in range(data.num_graphs):
-            # Wrap in shape (1, nhid) seamlessly for MeanTrainer
+            # Wrap in shape (1, dim) seamlessly for training
             emb_list.append(g_emb[g].unsqueeze(0))
             
         return emb_list

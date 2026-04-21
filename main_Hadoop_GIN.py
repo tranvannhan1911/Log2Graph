@@ -20,8 +20,8 @@ from types import SimpleNamespace
 from matplotlib import rcParams
 rcParams.update({'figure.autolayout': False})
 
-# Import new AttentionGIN and MultiCenterSVDDTrainer
-from DataLoader import create_loaders, MeanTrainer, AttentionGIN, MultiCenterSVDDTrainer
+# Import new AttentionGIN and Trainers
+from DataLoader import create_loaders, MeanTrainer, AttentionGIN, MultiCenterSVDDTrainer, ContrastiveTrainer
 
 
 
@@ -139,6 +139,13 @@ def run_experiment(
             num_centers=args.num_centers,
             device=device
         )
+    elif aggregation=="Contrastive":
+        trainer = ContrastiveTrainer(
+            model=model,
+            optimizer=optimizer,
+            temperature=0.1,
+            device=device
+        )
     
     epochinfo = []
 
@@ -210,8 +217,8 @@ parser.add_argument('--layers', type=int, default=2,
 parser.add_argument('--bias', action="store_true", default = False,
                                     help='Whether to use bias terms in the GNN.')
 
-parser.add_argument('--aggregation', type=str, default="MultiCenter", choices=["Mean", "MultiCenter"],
-                    help='Type of graph level aggregation (default: MultiCenter)')
+parser.add_argument('--aggregation', type=str, default="Contrastive", choices=["Mean", "MultiCenter", "Contrastive"],
+                    help='Type of graph level aggregation (default: Contrastive)')
 
 parser.add_argument('--num_centers', type=int, default=5,
                     help='Number of centers for MultiCenter aggregation (default: 5)')
