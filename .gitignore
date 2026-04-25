@@ -1,3 +1,14 @@
 venv/
 __pycache__/
-Data/
+.DS_Store
+
+# Bỏ qua TOÀN BỘ bên trong Data
+Data/*
+# Ngoại trừ các thư mục con ở level 1
+!Data/*/
+# Lại tiếp tục bỏ qua TOÀN BỘ nội dung bên trong các thư mục con đó
+Data/*/*
+# Và cuối cùng chỉ ngoại trừ lại Raw và processed/Processed
+!Data/*/Raw/
+!Data/*/processed/
+!Data/*/Processed/
